@@ -8,6 +8,7 @@
 (define-constant ERR_ALREADY_RELEASED (err u7))
 (define-constant ERR_INVALID_SCHOOL (err u8))
 (define-constant ERR_VAULT_EXISTS (err u9))
+(define-constant ERR_INVALID_DISCOUNT (err u10))
 
 (define-data-var vault-counter uint u0)
 (define-data-var total-locked uint u0)
@@ -61,6 +62,28 @@
     }
 )
 
+(define-map school-discounts
+    { school: principal }
+    {
+        early-payment-discount: uint,
+        multi-child-discount: uint,
+        loyalty-discount: uint,
+        min-blocks-early: uint,
+    }
+)
+
+(define-map parent-discount-eligibility
+    {
+        parent: principal,
+        school: principal,
+    }
+    {
+        children-count: uint,
+        total-paid: uint,
+        loyalty-tier: uint,
+    }
+)
+
 (define-read-only (get-vault (vault-id uint))
     (map-get? vaults { vault-id: vault-id })
 )
@@ -71,6 +94,20 @@
 
 (define-read-only (get-parent-stats (parent principal))
     (map-get? parent-stats { parent: parent })
+)
+
+(define-read-only (get-school-discounts (school principal))
+    (map-get? school-discounts { school: school })
+)
+
+(define-read-only (get-parent-discount-eligibility
+        (parent principal)
+        (school principal)
+    )
+    (map-get? parent-discount-eligibility {
+        parent: parent,
+        school: school,
+    })
 )
 
 (define-read-only (get-contract-stats)
@@ -111,6 +148,61 @@
             )
         )
         "not-found"
+    )
+)
+
+(define-read-only (calculate-discount-amount
+        (original-amount uint)
+        (parent principal)
+        (school principal)
+        (blocks-until-release uint)
+    )
+    (let (
+            (discount-config (default-to {
+                early-payment-discount: u0,
+                multi-child-discount: u0,
+                loyalty-discount: u0,
+                min-blocks-early: u0,
+            }
+                (map-get? school-discounts { school: school })
+            ))
+            (parent-eligibility (default-to {
+                children-count: u1,
+                total-paid: u0,
+                loyalty-tier: u0,
+            }
+                (map-get? parent-discount-eligibility {
+                    parent: parent,
+                    school: school,
+                })
+            ))
+            (early-payment-eligible (>= blocks-until-release (get min-blocks-early discount-config)))
+            (multi-child-eligible (> (get children-count parent-eligibility) u1))
+            (loyalty-eligible (> (get loyalty-tier parent-eligibility) u0))
+            (total-discount-rate (+
+                (if early-payment-eligible
+                    (get early-payment-discount discount-config)
+                    u0
+                )
+                (if multi-child-eligible
+                    (get multi-child-discount discount-config)
+                    u0
+                )
+                (if loyalty-eligible
+                    (get loyalty-discount discount-config)
+                    u0
+                )))
+            (capped-discount-rate (if (> total-discount-rate u50)
+                u50
+                total-discount-rate
+            ))
+            (discount-amount (/ (* original-amount capped-discount-rate) u100))
+        )
+        {
+            discounted-amount: (- original-amount discount-amount),
+            discount-amount: discount-amount,
+            discount-rate: capped-discount-rate,
+        }
     )
 )
 
@@ -194,6 +286,75 @@
     )
 )
 
+(define-public (set-school-discounts
+        (early-payment-discount uint)
+        (multi-child-discount uint)
+        (loyalty-discount uint)
+        (min-blocks-early uint)
+    )
+    (let ((school tx-sender))
+        (if (is-some (map-get? school-info { school: school }))
+            (if (and
+                    (<= early-payment-discount u50)
+                    (<= multi-child-discount u50)
+                    (<= loyalty-discount u50)
+                )
+                (begin
+                    (map-set school-discounts { school: school } {
+                        early-payment-discount: early-payment-discount,
+                        multi-child-discount: multi-child-discount,
+                        loyalty-discount: loyalty-discount,
+                        min-blocks-early: min-blocks-early,
+                    })
+                    (ok true)
+                )
+                ERR_INVALID_DISCOUNT
+            )
+            ERR_INVALID_SCHOOL
+        )
+    )
+)
+
+(define-public (update-parent-eligibility
+        (parent principal)
+        (children-count uint)
+    )
+    (let ((school tx-sender))
+        (if (is-some (map-get? school-info { school: school }))
+            (let (
+                    (current-eligibility (default-to {
+                        children-count: u1,
+                        total-paid: u0,
+                        loyalty-tier: u0,
+                    }
+                        (map-get? parent-discount-eligibility {
+                            parent: parent,
+                            school: school,
+                        })
+                    ))
+                    (new-loyalty-tier (if (>= (get total-paid current-eligibility) u1000000)
+                        u2
+                        (if (>= (get total-paid current-eligibility) u500000)
+                            u1
+                            u0
+                        )
+                    ))
+                )
+                (map-set parent-discount-eligibility {
+                    parent: parent,
+                    school: school,
+                } {
+                    children-count: children-count,
+                    total-paid: (get total-paid current-eligibility),
+                    loyalty-tier: new-loyalty-tier,
+                })
+                (ok true)
+            )
+            ERR_INVALID_SCHOOL
+        )
+    )
+)
+
 (define-public (create-vault
         (student-name (string-ascii 100))
         (school principal)
@@ -206,13 +367,19 @@
         )
         (if (and (> (stx-get-balance tx-sender) u0) (> release-blocks u0))
             (if (is-some (map-get? school-info { school: school }))
-                (let ((amount (stx-get-balance tx-sender)))
-                    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+                (let (
+                        (amount (stx-get-balance tx-sender))
+                        (discount-info (calculate-discount-amount amount tx-sender school
+                            release-blocks
+                        ))
+                        (final-amount (get discounted-amount discount-info))
+                    )
+                    (try! (stx-transfer? final-amount tx-sender (as-contract tx-sender)))
                     (map-set vaults { vault-id: vault-id } {
                         parent: tx-sender,
                         student-name: student-name,
                         school: school,
-                        amount: amount,
+                        amount: final-amount,
                         release-block: release-block,
                         created-block: burn-block-height,
                         released: false,
@@ -229,8 +396,27 @@
                     } { exists: true }
                     )
                     (var-set vault-counter vault-id)
-                    (var-set total-locked (+ (var-get total-locked) amount))
-                    (update-parent-stats tx-sender amount true)
+                    (var-set total-locked (+ (var-get total-locked) final-amount))
+                    (update-parent-stats tx-sender final-amount true)
+                    (let ((current-eligibility (default-to {
+                            children-count: u1,
+                            total-paid: u0,
+                            loyalty-tier: u0,
+                        }
+                            (map-get? parent-discount-eligibility {
+                                parent: tx-sender,
+                                school: school,
+                            })
+                        )))
+                        (map-set parent-discount-eligibility {
+                            parent: tx-sender,
+                            school: school,
+                        } {
+                            children-count: (get children-count current-eligibility),
+                            total-paid: (+ (get total-paid current-eligibility) final-amount),
+                            loyalty-tier: (get loyalty-tier current-eligibility),
+                        })
+                    )
                     (ok vault-id)
                 )
                 ERR_INVALID_SCHOOL
@@ -348,8 +534,14 @@
 (define-read-only (get-releasable-vaults-count)
     (let ((current-count (var-get vault-counter)))
         (fold check-releasable-vault
-            (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18
-                u19 u20)
+            (list
+                u1                 u2                 u3                 u4
+                u5                 u6                 u7                 u8
+                u9                 u10                 u11                 u12
+                u13                 u14                 u15                 u16
+                u17                 u18
+                u19                 u20
+            )
             u0
         )
     )
