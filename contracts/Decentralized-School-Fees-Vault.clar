@@ -9,6 +9,8 @@
 (define-constant ERR_INVALID_SCHOOL (err u8))
 (define-constant ERR_VAULT_EXISTS (err u9))
 (define-constant ERR_INVALID_DISCOUNT (err u10))
+(define-constant ERR_INVALID_DISTRIBUTION (err u11))
+(define-constant ERR_DISTRIBUTION_NOT_FOUND (err u12))
 
 (define-data-var vault-counter uint u0)
 (define-data-var total-locked uint u0)
@@ -84,6 +86,30 @@
     }
 )
 
+(define-map school-distribution-config
+    { school: principal }
+    {
+        operations: uint,
+        scholarship: uint,
+        maintenance: uint,
+        emergency: uint,
+        operations-wallet: principal,
+        scholarship-wallet: principal,
+        maintenance-wallet: principal,
+        emergency-wallet: principal,
+    }
+)
+
+(define-map distribution-stats
+    { school: principal }
+    {
+        total-operations: uint,
+        total-scholarship: uint,
+        total-maintenance: uint,
+        total-emergency: uint,
+    }
+)
+
 (define-read-only (get-vault (vault-id uint))
     (map-get? vaults { vault-id: vault-id })
 )
@@ -108,6 +134,14 @@
         parent: parent,
         school: school,
     })
+)
+
+(define-read-only (get-school-distribution-config (school principal))
+    (map-get? school-distribution-config { school: school })
+)
+
+(define-read-only (get-distribution-stats (school principal))
+    (map-get? distribution-stats { school: school })
 )
 
 (define-read-only (get-contract-stats)
@@ -148,6 +182,41 @@
             )
         )
         "not-found"
+    )
+)
+
+(define-read-only (calculate-distribution-amounts
+        (total-amount uint)
+        (school principal)
+    )
+    (match (map-get? school-distribution-config { school: school })
+        distribution-config (let (
+                (operations-amount (/ (* total-amount (get operations distribution-config)) u100))
+                (scholarship-amount (/ (* total-amount (get scholarship distribution-config)) u100))
+                (maintenance-amount (/ (* total-amount (get maintenance distribution-config)) u100))
+                (emergency-amount (/ (* total-amount (get emergency distribution-config)) u100))
+            )
+            {
+                operations-amount: operations-amount,
+                scholarship-amount: scholarship-amount,
+                maintenance-amount: maintenance-amount,
+                emergency-amount: emergency-amount,
+                operations-wallet: (get operations-wallet distribution-config),
+                scholarship-wallet: (get scholarship-wallet distribution-config),
+                maintenance-wallet: (get maintenance-wallet distribution-config),
+                emergency-wallet: (get emergency-wallet distribution-config),
+            }
+        )
+        {
+            operations-amount: total-amount,
+            scholarship-amount: u0,
+            maintenance-amount: u0,
+            emergency-amount: u0,
+            operations-wallet: school,
+            scholarship-wallet: school,
+            maintenance-wallet: school,
+            emergency-wallet: school,
+        }
     )
 )
 
@@ -253,6 +322,30 @@
     )
 )
 
+(define-private (update-distribution-stats
+        (school principal)
+        (operations-amount uint)
+        (scholarship-amount uint)
+        (maintenance-amount uint)
+        (emergency-amount uint)
+    )
+    (let ((current-stats (default-to {
+            total-operations: u0,
+            total-scholarship: u0,
+            total-maintenance: u0,
+            total-emergency: u0,
+        }
+            (map-get? distribution-stats { school: school })
+        )))
+        (map-set distribution-stats { school: school } {
+            total-operations: (+ (get total-operations current-stats) operations-amount),
+            total-scholarship: (+ (get total-scholarship current-stats) scholarship-amount),
+            total-maintenance: (+ (get total-maintenance current-stats) maintenance-amount),
+            total-emergency: (+ (get total-emergency current-stats) emergency-amount),
+        })
+    )
+)
+
 (define-public (register-school (name (string-ascii 100)))
     (let ((school tx-sender))
         (if (is-some (map-get? school-info { school: school }))
@@ -309,6 +402,44 @@
                     (ok true)
                 )
                 ERR_INVALID_DISCOUNT
+            )
+            ERR_INVALID_SCHOOL
+        )
+    )
+)
+
+(define-public (configure-fee-distribution
+        (operations-percentage uint)
+        (scholarship-percentage uint)
+        (maintenance-percentage uint)
+        (emergency-percentage uint)
+        (operations-wallet principal)
+        (scholarship-wallet principal)
+        (maintenance-wallet principal)
+        (emergency-wallet principal)
+    )
+    (let ((school tx-sender))
+        (if (is-some (map-get? school-info { school: school }))
+            (if (is-eq
+                    (+ operations-percentage scholarship-percentage
+                        maintenance-percentage emergency-percentage
+                    )
+                    u100
+                )
+                (begin
+                    (map-set school-distribution-config { school: school } {
+                        operations: operations-percentage,
+                        scholarship: scholarship-percentage,
+                        maintenance: maintenance-percentage,
+                        emergency: emergency-percentage,
+                        operations-wallet: operations-wallet,
+                        scholarship-wallet: scholarship-wallet,
+                        maintenance-wallet: maintenance-wallet,
+                        emergency-wallet: emergency-wallet,
+                    })
+                    (ok true)
+                )
+                ERR_INVALID_DISTRIBUTION
             )
             ERR_INVALID_SCHOOL
         )
@@ -460,8 +591,32 @@
                 (let (
                         (amount (get amount vault-data))
                         (school (get school vault-data))
+                        (distribution (calculate-distribution-amounts amount school))
                     )
-                    (try! (as-contract (stx-transfer? amount tx-sender school)))
+                    (if (> (get operations-amount distribution) u0)
+                        (try! (as-contract (stx-transfer? (get operations-amount distribution)
+                            tx-sender (get operations-wallet distribution)
+                        )))
+                        true
+                    )
+                    (if (> (get scholarship-amount distribution) u0)
+                        (try! (as-contract (stx-transfer? (get scholarship-amount distribution)
+                            tx-sender (get scholarship-wallet distribution)
+                        )))
+                        true
+                    )
+                    (if (> (get maintenance-amount distribution) u0)
+                        (try! (as-contract (stx-transfer? (get maintenance-amount distribution)
+                            tx-sender (get maintenance-wallet distribution)
+                        )))
+                        true
+                    )
+                    (if (> (get emergency-amount distribution) u0)
+                        (try! (as-contract (stx-transfer? (get emergency-amount distribution)
+                            tx-sender (get emergency-wallet distribution)
+                        )))
+                        true
+                    )
                     (map-set vaults { vault-id: vault-id }
                         (merge vault-data { released: true })
                     )
@@ -469,6 +624,12 @@
                     (var-set total-locked (- (var-get total-locked) amount))
                     (update-parent-stats (get parent vault-data) amount false)
                     (update-school-stats school amount)
+                    (update-distribution-stats school
+                        (get operations-amount distribution)
+                        (get scholarship-amount distribution)
+                        (get maintenance-amount distribution)
+                        (get emergency-amount distribution)
+                    )
                     (ok true)
                 )
                 ERR_ALREADY_RELEASED
