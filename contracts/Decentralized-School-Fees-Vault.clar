@@ -12,6 +12,11 @@
 (define-constant ERR_INVALID_DISTRIBUTION (err u11))
 (define-constant ERR_DISTRIBUTION_NOT_FOUND (err u12))
 
+;; Analytics & Reporting System Error Constants
+(define-constant ERR_ANALYTICS_NOT_FOUND (err u301))
+(define-constant ERR_INVALID_DATE_RANGE (err u302))
+(define-constant ERR_NO_DATA_AVAILABLE (err u303))
+
 (define-data-var vault-counter uint u0)
 (define-data-var total-locked uint u0)
 (define-data-var total-released uint u0)
@@ -107,6 +112,36 @@
         total-scholarship: uint,
         total-maintenance: uint,
         total-emergency: uint,
+    }
+)
+
+;; Analytics & Reporting System Data Maps
+(define-map monthly-payment-totals
+    { year: uint, month: uint }
+    {
+        total-amount: uint,
+        payment-count: uint,
+        unique-schools: uint,
+        unique-parents: uint,
+    }
+)
+
+(define-map seasonal-trends
+    { year: uint, quarter: uint }
+    {
+        total-payments: uint,
+        avg-payment: uint,
+        student-count: uint,
+        peak-payment-day: uint,
+    }
+)
+
+(define-map payment-day-statistics
+    { day-of-month: uint }
+    {
+        payment-count: uint,
+        total-amount: uint,
+        avg-amount: uint,
     }
 )
 
@@ -735,5 +770,192 @@
     (match (map-get? vaults { vault-id: vault-id })
         vault-data (is-eq school (get school vault-data))
         false
+    )
+)
+
+;; ==========================================
+;; ANALYTICS & REPORTING SYSTEM
+;; ==========================================
+
+;; Get monthly payment statistics
+(define-read-only (get-monthly-statistics (year uint) (month uint))
+    (if (and (>= year u2020) (<= year u2050) (>= month u1) (<= month u12))
+        (match (map-get? monthly-payment-totals { year: year, month: month })
+            stats (ok stats)
+            ERR_ANALYTICS_NOT_FOUND
+        )
+        ERR_INVALID_DATE_RANGE
+    )
+)
+
+;; Get quarterly seasonal trends
+(define-read-only (get-quarterly-trends (year uint) (quarter uint))
+    (if (and (>= year u2020) (<= year u2050) (>= quarter u1) (<= quarter u4))
+        (match (map-get? seasonal-trends { year: year, quarter: quarter })
+            trends (ok trends)
+            ERR_ANALYTICS_NOT_FOUND
+        )
+        ERR_INVALID_DATE_RANGE
+    )
+)
+
+;; Calculate average payments over date range
+(define-read-only (calculate-payment-average (start-year uint) (end-year uint))
+    (if (and (>= start-year u2020) (<= end-year u2050) (<= start-year end-year))
+        (let (
+            (year-diff (- end-year start-year))
+            (vault-count (var-get vault-counter))
+            (released-amount (var-get total-released))
+        )
+            (if (> vault-count u0)
+                (ok {
+                    average-payment: (/ released-amount vault-count),
+                    total-payments: vault-count,
+                    years-analyzed: (+ year-diff u1),
+                    success: true,
+                })
+                ERR_NO_DATA_AVAILABLE
+            )
+        )
+        ERR_INVALID_DATE_RANGE
+    )
+)
+
+;; Get payment frequency by day of month
+(define-read-only (get-payment-day-pattern (day uint))
+    (if (and (>= day u1) (<= day u31))
+        (match (map-get? payment-day-statistics { day-of-month: day })
+            pattern (ok pattern)
+            (ok {
+                payment-count: u0,
+                total-amount: u0,
+                avg-amount: u0,
+            })
+        )
+        ERR_INVALID_DATE_RANGE
+    )
+)
+
+;; Aggregate yearly payment totals
+(define-read-only (aggregate-yearly-totals (year uint))
+    (if (and (>= year u2020) (<= year u2050))
+        (let (
+            (q1 (default-to { total-payments: u0, avg-payment: u0, student-count: u0, peak-payment-day: u0 }
+                (map-get? seasonal-trends { year: year, quarter: u1 })))
+            (q2 (default-to { total-payments: u0, avg-payment: u0, student-count: u0, peak-payment-day: u0 }
+                (map-get? seasonal-trends { year: year, quarter: u2 })))
+            (q3 (default-to { total-payments: u0, avg-payment: u0, student-count: u0, peak-payment-day: u0 }
+                (map-get? seasonal-trends { year: year, quarter: u3 })))
+            (q4 (default-to { total-payments: u0, avg-payment: u0, student-count: u0, peak-payment-day: u0 }
+                (map-get? seasonal-trends { year: year, quarter: u4 })))
+            (total-yearly-payments (+ (+ (get total-payments q1) (get total-payments q2))
+                                    (+ (get total-payments q3) (get total-payments q4))))
+            (total-yearly-students (+ (+ (get student-count q1) (get student-count q2))
+                                    (+ (get student-count q3) (get student-count q4))))
+        )
+            (ok {
+                year: year,
+                total-payments: total-yearly-payments,
+                total-students: total-yearly-students,
+                avg-yearly-payment: (if (> total-yearly-payments u0) (/ total-yearly-payments u4) u0),
+                quarters-analyzed: u4,
+            })
+        )
+        ERR_INVALID_DATE_RANGE
+    )
+)
+
+;; Generate comprehensive vault performance metrics
+(define-read-only (generate-performance-metrics)
+    (let (
+        (vault-count (var-get vault-counter))
+        (locked-amount (var-get total-locked))
+        (released-amount (var-get total-released))
+        (overall-total (+ locked-amount released-amount))
+    )
+        (ok {
+            total-vaults-created: vault-count,
+            total-amount-locked: locked-amount,
+            total-amount-released: released-amount,
+            total-amount-processed: overall-total,
+            release-rate: (if (> overall-total u0) (/ (* released-amount u100) overall-total) u0),
+            avg-vault-size: (if (> vault-count u0) (/ overall-total vault-count) u0),
+            system-utilization: (if (> overall-total u0) (/ (* locked-amount u100) overall-total) u0),
+            performance-score: (if (> vault-count u10) u100 (* vault-count u10)),
+        })
+    )
+)
+
+;; Get analytics system health status
+(define-read-only (get-analytics-health)
+    (let (
+        (vault-count (var-get vault-counter))
+        (total-processed (+ (var-get total-locked) (var-get total-released)))
+    )
+        (ok {
+            system-status: (if (> vault-count u0) "active" "inactive"),
+            data-points: vault-count,
+            total-volume: total-processed,
+            analytics-version: "v1.0.0",
+            last-updated: burn-block-height,
+        })
+    )
+)
+
+;; Calculate month from block height (simplified approximation)
+(define-read-only (get-month-from-block (target-block uint))
+    (let (
+        (blocks-per-month u4320) ;; Approximate blocks per month (144 blocks/day * 30 days)
+        (months-since-genesis (/ target-block blocks-per-month))
+        (month (+ (mod months-since-genesis u12) u1))
+    )
+        month
+    )
+)
+
+;; Calculate year from block height (simplified approximation)
+(define-read-only (get-year-from-block (target-block uint))
+    (let (
+        (blocks-per-year u51840) ;; Approximate blocks per year (144 blocks/day * 360 days)
+        (years-since-genesis (/ target-block blocks-per-year))
+        (year (+ years-since-genesis u2020)) ;; Base year 2020
+    )
+        year
+    )
+)
+
+;; Calculate quarter from month
+(define-read-only (get-quarter-from-month (month uint))
+    (if (<= month u3) u1
+        (if (<= month u6) u2
+            (if (<= month u9) u3 u4)
+        )
+    )
+)
+
+;; Get comprehensive vault insights
+(define-read-only (get-vault-insights (vault-id uint))
+    (match (map-get? vaults { vault-id: vault-id })
+        vault-data (let (
+            (created-month (get-month-from-block (get created-block vault-data)))
+            (created-year (get-year-from-block (get created-block vault-data)))
+            (created-quarter (get-quarter-from-month created-month))
+            (days-locked (/ (- (get release-block vault-data) (get created-block vault-data)) u144))
+        )
+            (ok {
+                vault-id: vault-id,
+                created-month: created-month,
+                created-year: created-year,
+                created-quarter: created-quarter,
+                lock-duration-days: days-locked,
+                amount: (get amount vault-data),
+                status: (get-vault-status vault-id),
+                parent: (get parent vault-data),
+                school: (get school vault-data),
+                student-name: (get student-name vault-data),
+                term: (get term vault-data),
+            })
+        )
+        ERR_VAULT_NOT_FOUND
     )
 )
