@@ -381,6 +381,73 @@
     )
 )
 
+(define-private (update-payment-analytics
+        (amount uint)
+        (school principal)
+    )
+    (let (
+            (current-block burn-block-height)
+            (year (get-year-from-block current-block))
+            (month (get-month-from-block current-block))
+            (quarter (get-quarter-from-month month))
+            (blocks-per-day u144)
+            (day-of-month (+ (mod (/ (mod current-block (* blocks-per-day u30)) blocks-per-day) u31) u1))
+        )
+        (let (
+                (monthly-stats (default-to {
+                    total-amount: u0,
+                    payment-count: u0,
+                    unique-schools: u0,
+                    unique-parents: u0,
+                }
+                    (map-get? monthly-payment-totals { year: year, month: month })
+                ))
+                (quarterly-stats (default-to {
+                    total-payments: u0,
+                    avg-payment: u0,
+                    student-count: u0,
+                    peak-payment-day: u0,
+                }
+                    (map-get? seasonal-trends { year: year, quarter: quarter })
+                ))
+                (day-stats (default-to {
+                    payment-count: u0,
+                    total-amount: u0,
+                    avg-amount: u0,
+                }
+                    (map-get? payment-day-statistics { day-of-month: day-of-month })
+                ))
+            )
+            (let (
+                    (new-monthly-total (+ (get total-amount monthly-stats) amount))
+                    (new-monthly-count (+ (get payment-count monthly-stats) u1))
+                    (new-quarterly-total (+ (get total-payments quarterly-stats) amount))
+                    (new-quarterly-count (+ (get student-count quarterly-stats) u1))
+                    (new-day-count (+ (get payment-count day-stats) u1))
+                    (new-day-total (+ (get total-amount day-stats) amount))
+                )
+                (map-set monthly-payment-totals { year: year, month: month } {
+                    total-amount: new-monthly-total,
+                    payment-count: new-monthly-count,
+                    unique-schools: (+ (get unique-schools monthly-stats) u1),
+                    unique-parents: (+ (get unique-parents monthly-stats) u1),
+                })
+                (map-set seasonal-trends { year: year, quarter: quarter } {
+                    total-payments: new-quarterly-total,
+                    avg-payment: (if (> new-quarterly-count u0) (/ new-quarterly-total new-quarterly-count) u0),
+                    student-count: new-quarterly-count,
+                    peak-payment-day: day-of-month,
+                })
+                (map-set payment-day-statistics { day-of-month: day-of-month } {
+                    payment-count: new-day-count,
+                    total-amount: new-day-total,
+                    avg-amount: (if (> new-day-count u0) (/ new-day-total new-day-count) u0),
+                })
+            )
+        )
+    )
+)
+
 (define-public (register-school (name (string-ascii 100)))
     (let ((school tx-sender))
         (if (is-some (map-get? school-info { school: school }))
@@ -665,6 +732,7 @@
                         (get maintenance-amount distribution)
                         (get emergency-amount distribution)
                     )
+                    (update-payment-analytics amount school)
                     (ok true)
                 )
                 ERR_ALREADY_RELEASED
